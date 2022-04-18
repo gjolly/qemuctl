@@ -1,3 +1,0 @@
-#cloud-config
-ssh_import_id:
-  - gh:gjolly
