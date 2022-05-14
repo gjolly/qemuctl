@@ -186,8 +186,8 @@ type QemuParams struct {
 }
 
 var defaultOption = map[string][]string{
-	"aarch64": {"-cpu", "max", "-machine", "virt"},
-	"x86_64":  {"-cpu", "host", "-machine", "q35"},
+	"aarch64": {"-cpu", "max", "-machine", "virt", "-smp", "4"},
+	"x86_64":  {"-cpu", "host", "-machine", "q35", "-smp", "4"},
 }
 
 func charToString(bs [65]int8) string {
