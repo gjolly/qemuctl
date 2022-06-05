@@ -1,0 +1,31 @@
+---
+machines:
+  jammy01:
+    image: /var/tmp/ubuntu-22.04-server-cloudimg-amd64.img
+    uefi: true
+    snapshot: true
+    memory: 2G
+    network: net01
+    users:
+      default:
+        password: pass
+        ssh_import_id:
+          - gh:gjolly
+        ssh_keys: []
+
+  jammy02:
+    image: /var/tmp/ubuntu-22.04-server-cloudimg-amd64.img
+    uefi: true
+    snapshot: true
+    memory: 2G
+    network: net01
+    users:
+      default:
+        password: pass
+        ssh_import_id:
+          - gh:gjolly
+        ssh_keys: []
+
+network:
+  net01:
+    type: tap

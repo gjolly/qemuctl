@@ -7,13 +7,16 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
-	"os/exec"
 	"path"
 	"syscall"
 	"time"
 
 	"github.com/pkg/errors"
 	"gopkg.in/yaml.v2"
+
+	"github.com/gjolly/qemuctl/internal/commands"
+	"github.com/gjolly/qemuctl/internal/config"
+	"github.com/gjolly/qemuctl/internal/network"
 )
 
 // UEFIFirmware is defines the path to the UEFI parameters
@@ -35,70 +38,21 @@ var UEFIFirmwares = map[string]UEFIFirmware{
 }
 
 func main() {
-	imagePath := flag.String("image", "", "Image containing the root filesystem to boot.")
-	suite := flag.String("suite", "", "Download the latest image to this suite and start it.")
-	uefi := flag.Bool("uefi", false, "Use UEFI firemware.")
-	arch := flag.String("arch", "x86_64", "Architecture to use")
-	memory := flag.Int("memory", 2048, "Memory to allocate")
-	noSnapshot := flag.Bool("no-snapshot", false, "Automatically commit changes to the image")
-	sshKey := flag.String("sshkey", "", "Public key to add to the user.")
-	sshID := flag.String("sshid", "", "ID used to import a key using ssh-import-id.")
-	uefiVars := flag.String("uefivars", "", "File containing UEFI variable (eg with default boot entry set).")
-	tap := flag.String("tap", "tap0", "Tap device to use (otherwise it will use 'user' mode.")
-	password := flag.String("password", "", "User's password")
+	configPath := flag.String("config", "", "Path to config file")
 	flag.Parse()
 
-	tmpDir, err := os.MkdirTemp(os.TempDir(), "qemu")
+	config, err := config.GetConfig(*configPath)
 	if err != nil {
 		panic(err)
 	}
-	defer os.RemoveAll(tmpDir)
 
-	if *imagePath == "" {
-		if *suite == "" || *arch == "" {
-			fmt.Println("no image specified or suite and arch specified")
-			flag.Usage()
-			os.Exit(1)
-		}
-
-		image, err := downloadImage(tmpDir, *suite, *arch)
-		if err != nil {
-			fmt.Printf("failed to download image for %v %v", *suite, *arch)
-			flag.Usage()
-			os.Exit(1)
-		}
-
-		*imagePath = image
-	}
-
-	cloudInitConfig := CloudInitConfig{
-		SSHKey:   *sshKey,
-		Password: *password,
-	}
-
-	if *sshID != "" {
-		cloudInitConfig.SSHImportID = []string{*sshID}
-	}
-
-	cloudInitSeedPath, err := generateCloudInitSeed(tmpDir, &cloudInitConfig)
-
+	err = network.StartNetworks(config.Network)
 	if err != nil {
 		panic(err)
 	}
-	params := QemuParams{
-		ImagePath:          *imagePath,
-		CloudInitSeedPath:  cloudInitSeedPath,
-		Arch:               *arch,
-		Memory:             *memory,
-		NoSnapshot:         *noSnapshot,
-		UEFIEnabled:        *uefi,
-		CustomUEFIVarsFile: *uefiVars,
-		TapDevice:          *tap,
-	}
 
-	err = runQemu(&params, tmpDir)
-	if err != nil {
-		panic(err)
+	for vmName, vmConfig := range config.Machines {
+		go startVM(vmName, vmConfig)
 	}
 }
 
@@ -112,6 +66,65 @@ var suiteToVersion = map[string]string{
 var ubuntuArches = map[string]string{
 	"aarch64": "arm64",
 	"x86_64":  "amd64",
+}
+
+func startVM(name string, config config.MachineConfig) {
+	tmpDir, err := os.MkdirTemp(os.TempDir(), "qemu")
+	if err != nil {
+		panic(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	if config.Image == "" {
+		if config.Suite == "" || config.Arch == "" {
+			fmt.Println("no image specified or suite and arch specified")
+			flag.Usage()
+			os.Exit(1)
+		}
+
+		image, err := downloadImage(tmpDir, config.Suite, config.Arch)
+		if err != nil {
+			fmt.Printf("failed to download image for %v %v", config.Suite, config.Arch)
+			flag.Usage()
+			os.Exit(1)
+		}
+
+		config.Image = image
+	}
+
+	cloudInitConfig := CloudInitConfig{
+		SSHKey:      config.Users["default"].SSHKeys,
+		SSHImportID: config.Users["default"].SSHImportID,
+		Password:    config.Users["default"].Password,
+	}
+
+	cloudInitSeedPath, err := generateCloudInitSeed(tmpDir, &cloudInitConfig)
+	if err != nil {
+		panic(err)
+	}
+
+	tapDevice := ""
+	if len(config.Network) != 0 {
+		tapDevice, err = network.NewTapDevice(config.Network)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	params := QemuParams{
+		ImagePath:         config.Image,
+		CloudInitSeedPath: cloudInitSeedPath,
+		Arch:              config.Arch,
+		Memory:            config.Memory,
+		NoSnapshot:        !config.Snapshot,
+		UEFIEnabled:       config.UEFI,
+		TapDevice:         tapDevice,
+	}
+
+	err = runQemu(&params, tmpDir)
+	if err != nil {
+		panic(err)
+	}
 }
 
 func downloadImage(tmpDir, suite, arch string) (string, error) {
@@ -147,7 +160,7 @@ func downloadImage(tmpDir, suite, arch string) (string, error) {
 // on the host
 type CloudInitConfig struct {
 	SSHImportID []string
-	SSHKey      string
+	SSHKey      []string
 	Password    string
 }
 
@@ -191,7 +204,7 @@ func generateCloudInitSeed(dir string, config *CloudInitConfig) (string, error) 
 
 	if len(config.SSHKey) != 0 {
 		out, _ := yaml.Marshal(map[string][]string{
-			"ssh_authorized_keys": {config.SSHKey},
+			"ssh_authorized_keys": config.SSHKey,
 		})
 		_, err = file.Write(out)
 		if err != nil {
@@ -200,7 +213,7 @@ func generateCloudInitSeed(dir string, config *CloudInitConfig) (string, error) 
 	}
 
 	seedPath := path.Join(dir, "seed.img")
-	err = runCommand("cloud-localds", seedPath, userDataPath)
+	err = commands.Run("cloud-localds", seedPath, userDataPath)
 
 	return seedPath, err
 }
@@ -210,7 +223,7 @@ type QemuParams struct {
 	ImagePath          string
 	CloudInitSeedPath  string
 	Arch               string
-	Memory             int
+	Memory             string
 	UEFIEnabled        bool
 	NoSnapshot         bool
 	CustomUEFIVarsFile string
@@ -314,12 +327,12 @@ func runQemu(qemuParams *QemuParams, tmpDir string) error {
 		"-drive", fmt.Sprintf("if=virtio,format=qcow2,file=%v", qemuParams.ImagePath),
 		"-drive", fmt.Sprintf("if=virtio,format=raw,file=%v", qemuParams.CloudInitSeedPath),
 	)
-	err := runCommand(fmt.Sprintf("qemu-system-%v", qemuParams.Arch), params...)
+	err := commands.Run(fmt.Sprintf("qemu-system-%v", qemuParams.Arch), params...)
 	return err
 }
 
 func createEmptyFile(path string, size int) error {
-	err := runCommand("dd", "if=/dev/zero",
+	err := commands.Run("dd", "if=/dev/zero",
 		fmt.Sprintf("of=%v", path),
 		"bs=1M", fmt.Sprintf("count=%v", size),
 	)
@@ -348,7 +361,7 @@ func getUEFIFirmware(tmpDir, uefiVarsFile, arch string) (string, string, error) 
 			return "", "", err
 		}
 
-		err = runCommand("dd",
+		err = commands.Run("dd",
 			fmt.Sprintf("if=%v", uefiFiremwareCodePath),
 			fmt.Sprintf("of=%v", newUEFIFirmwareCodePath),
 			"conv=notrunc",
@@ -382,24 +395,5 @@ func copyFile(src, dst string) error {
 
 	_, err = io.Copy(fout, fin)
 
-	return err
-}
-
-func runCommand(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
-
-	env := os.Environ()
-	cmd.Env = env
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-
-	fmt.Printf(">>> %v\n", cmd.String())
-	err := cmd.Start()
-	if err != nil {
-		return err
-	}
-
-	err = cmd.Wait()
 	return err
 }
