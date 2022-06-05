@@ -4,11 +4,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/exec"
 	"path"
 	"syscall"
+	"time"
 
 	"github.com/pkg/errors"
 	"gopkg.in/yaml.v2"
@@ -42,6 +44,8 @@ func main() {
 	sshKey := flag.String("sshkey", "", "Public key to add to the user.")
 	sshID := flag.String("sshid", "", "ID used to import a key using ssh-import-id.")
 	uefiVars := flag.String("uefivars", "", "File containing UEFI variable (eg with default boot entry set).")
+	tap := flag.String("tap", "tap0", "Tap device to use (otherwise it will use 'user' mode.")
+	password := flag.String("password", "", "User's password")
 	flag.Parse()
 
 	tmpDir, err := os.MkdirTemp(os.TempDir(), "qemu")
@@ -68,9 +72,14 @@ func main() {
 	}
 
 	cloudInitConfig := CloudInitConfig{
-		SSHKey:      *sshKey,
-		SSHImportID: []string{*sshID},
+		SSHKey:   *sshKey,
+		Password: *password,
 	}
+
+	if *sshID != "" {
+		cloudInitConfig.SSHImportID = []string{*sshID}
+	}
+
 	cloudInitSeedPath, err := generateCloudInitSeed(tmpDir, &cloudInitConfig)
 
 	if err != nil {
@@ -84,6 +93,7 @@ func main() {
 		NoSnapshot:         *noSnapshot,
 		UEFIEnabled:        *uefi,
 		CustomUEFIVarsFile: *uefiVars,
+		TapDevice:          *tap,
 	}
 
 	err = runQemu(&params, tmpDir)
@@ -138,6 +148,7 @@ func downloadImage(tmpDir, suite, arch string) (string, error) {
 type CloudInitConfig struct {
 	SSHImportID []string
 	SSHKey      string
+	Password    string
 }
 
 func generateCloudInitSeed(dir string, config *CloudInitConfig) (string, error) {
@@ -149,12 +160,33 @@ func generateCloudInitSeed(dir string, config *CloudInitConfig) (string, error) 
 	defer file.Close()
 
 	_, err = file.WriteString("#cloud-config\n")
+	if err != nil {
+		return "", err
+	}
+
+	if len(config.Password) != 0 {
+		_, err = file.WriteString(fmt.Sprintf("password: %v\n", config.Password))
+		if err != nil {
+			return "", err
+		}
+		_, err = file.WriteString("chpasswd:\n")
+		if err != nil {
+			return "", err
+		}
+		_, err = file.WriteString("  expire: false\n")
+		if err != nil {
+			return "", err
+		}
+	}
 
 	if len(config.SSHImportID) != 0 {
 		out, _ := yaml.Marshal(map[string][]string{
 			"ssh_import_id": config.SSHImportID,
 		})
 		_, err = file.Write(out)
+		if err != nil {
+			return "", err
+		}
 	}
 
 	if len(config.SSHKey) != 0 {
@@ -162,10 +194,9 @@ func generateCloudInitSeed(dir string, config *CloudInitConfig) (string, error) 
 			"ssh_authorized_keys": {config.SSHKey},
 		})
 		_, err = file.Write(out)
-	}
-
-	if err != nil {
-		return "", err
+		if err != nil {
+			return "", err
+		}
 	}
 
 	seedPath := path.Join(dir, "seed.img")
@@ -183,6 +214,7 @@ type QemuParams struct {
 	UEFIEnabled        bool
 	NoSnapshot         bool
 	CustomUEFIVarsFile string
+	TapDevice          string
 }
 
 var defaultOption = map[string][]string{
@@ -224,6 +256,16 @@ func kvmSupported(VMArch string) bool {
 	return true
 }
 
+func getCustomUEFIVarPath(imagePath string) (string, bool) {
+	dir := path.Dir(imagePath)
+	uefiVars := path.Join(dir, "EFI_VARS.fd")
+	if _, err := os.Stat(uefiVars); err != nil {
+		return uefiVars, false
+	}
+
+	return uefiVars, true
+}
+
 func runQemu(qemuParams *QemuParams, tmpDir string) error {
 	params := defaultOption[qemuParams.Arch]
 	params = append(params, "-m", fmt.Sprintf("%v", qemuParams.Memory), "-nographic")
@@ -236,15 +278,31 @@ func runQemu(qemuParams *QemuParams, tmpDir string) error {
 		params = append(params, "--enable-kvm")
 	}
 
-	params = append(params, "-netdev", "id=net00,type=user,hostfwd=tcp::2222-:22",
-		"-device", "virtio-net-pci,netdev=net00",
-		"-drive", fmt.Sprintf("if=virtio,format=qcow2,file=%v", qemuParams.ImagePath),
-		"-drive", fmt.Sprintf("if=virtio,format=raw,file=%v", qemuParams.CloudInitSeedPath),
-	)
+	if len(qemuParams.TapDevice) == 0 {
+		params = append(params, "-netdev", "id=net00,type=user,hostfwd=tcp::2222-:22",
+			"-device", "virtio-net-pci,netdev=net00",
+		)
+	} else {
+		rand.Seed(time.Now().UnixNano())
+		macAddr := fmt.Sprintf("52:54:00:%x:%x:%x", rand.Intn(255), rand.Intn(255), rand.Intn(255))
+		params = append(params, "-netdev", fmt.Sprintf("tap,id=net0,ifname=%v,script=no,downscript=no",
+			qemuParams.TapDevice))
+		params = append(params, "-device", fmt.Sprintf("e1000,netdev=net0,mac=%v", macAddr))
+	}
 
 	if qemuParams.UEFIEnabled {
 		uefiFiremwareCodePath, uefiFirmwareVarsPath, _ := getUEFIFirmware(
 			tmpDir, qemuParams.CustomUEFIVarsFile, qemuParams.Arch)
+
+		if qemuParams.NoSnapshot && qemuParams.CustomUEFIVarsFile == "" {
+			customVars, exists := getCustomUEFIVarPath(qemuParams.ImagePath)
+			if exists {
+				uefiFirmwareVarsPath = customVars
+			} else {
+				copyFile(uefiFirmwareVarsPath, customVars)
+				uefiFirmwareVarsPath = customVars
+			}
+		}
 
 		params = append(params,
 			"-drive", fmt.Sprintf("if=pflash,format=raw,file=%v,readonly=true", uefiFiremwareCodePath),
@@ -252,6 +310,10 @@ func runQemu(qemuParams *QemuParams, tmpDir string) error {
 		)
 	}
 
+	params = append(params,
+		"-drive", fmt.Sprintf("if=virtio,format=qcow2,file=%v", qemuParams.ImagePath),
+		"-drive", fmt.Sprintf("if=virtio,format=raw,file=%v", qemuParams.CloudInitSeedPath),
+	)
 	err := runCommand(fmt.Sprintf("qemu-system-%v", qemuParams.Arch), params...)
 	return err
 }
